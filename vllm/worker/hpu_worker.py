@@ -58,10 +58,12 @@ class HPUWorker(LocalOrDistributedWorkerBase):
         if self.model_config.trust_remote_code:
             # note: lazy import to avoid importing torch before initializing
             from vllm.utils import init_cached_hf_modules
+
             init_cached_hf_modules()
 
         self.model_runner: HPUModelRunner = HPUModelRunner(
-            vllm_config=vllm_config, is_driver_worker=is_driver_worker)
+            vllm_config=vllm_config, is_driver_worker=is_driver_worker
+        )
         # Uninitialized cache engine. Will be initialized by
         # initialize_cache.
         self.cache_engine: List[HPUCacheEngine]
@@ -71,8 +73,10 @@ class HPUWorker(LocalOrDistributedWorkerBase):
         # VLLM_TORCH_PROFILER_DIR=/path/to/save/trace
         if envs.VLLM_TORCH_PROFILER_DIR:
             torch_profiler_trace_dir = envs.VLLM_TORCH_PROFILER_DIR
-            logger.info("Profiling enabled. Traces will be saved to: %s",
-                        torch_profiler_trace_dir)
+            logger.info(
+                "Profiling enabled. Traces will be saved to: %s",
+                torch_profiler_trace_dir,
+            )
             self.profiler = torch.profiler.profile(
                 activities=[
                     torch.profiler.ProfilerActivity.CPU,
@@ -80,7 +84,9 @@ class HPUWorker(LocalOrDistributedWorkerBase):
                 ],
                 with_stack=True,
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    torch_profiler_trace_dir, use_gzip=True))
+                    torch_profiler_trace_dir, use_gzip=True
+                ),
+            )
         else:
             self.profiler = None
 
@@ -99,6 +105,7 @@ class HPUWorker(LocalOrDistributedWorkerBase):
         if self.parallel_config.world_size == 1:
             local_rank = -1
         import os
+
         os.environ["LOCAL_RANK"] = str(local_rank)
         os.environ["ID"] = str(local_rank)
         os.environ["WORLD_SIZE"] = str(self.parallel_config.world_size)
@@ -109,14 +116,16 @@ class HPUWorker(LocalOrDistributedWorkerBase):
             self.device = torch.device("hpu")
             torch.hpu.set_device(self.device)
         else:
-            raise RuntimeError(
-                f"Not support device type: {self.device_config.device}")
+            raise RuntimeError(f"Not support device type: {self.device_config.device}")
         # Initialize the distributed environment.
-        if self.model_config.quantization == 'inc':
+        if self.model_config.quantization == "inc":
             self._set_env_vars()
-        init_worker_distributed_environment(self.parallel_config, self.rank,
-                                            self.distributed_init_method,
-                                            self.local_rank)
+        init_worker_distributed_environment(
+            self.parallel_config,
+            self.rank,
+            self.distributed_init_method,
+            self.local_rank,
+        )
         # Set random seed.
         set_random_seed(self.model_config.seed)
 
@@ -144,22 +153,25 @@ class HPUWorker(LocalOrDistributedWorkerBase):
         with HabanaMemoryProfiler() as m:
             self.model_runner.profile_run()
             torch.hpu.synchronize()
-        msg = ("Model profiling run "
-               f"took {m.get_summary_string()}")
+        msg = "Model profiling run " f"took {m.get_summary_string()}"
         logger.info(msg)
         # At this point we should've allocated the maximum workspace for all
         # recipes we will use the extra memory for graphs/blocks
         free_hpu_memory = torch.hpu.mem_get_info()[0]
 
         cache_block_size = self.get_cache_block_size_bytes()
-        graph_reserved_mem = (float(
-            os.environ.get('VLLM_GRAPH_RESERVED_MEM', '0.1'))
-                              if not self.model_config.enforce_eager else 0)
+        graph_reserved_mem = (
+            float(os.environ.get("VLLM_GRAPH_RESERVED_MEM", "0.1"))
+            if not self.model_config.enforce_eager
+            else 0
+        )
         graph_headroom = 1 - graph_reserved_mem
-        available_hpu_memory = free_hpu_memory * \
-            self.cache_config.gpu_memory_utilization
+        available_hpu_memory = (
+            free_hpu_memory * self.cache_config.gpu_memory_utilization
+        )
         hpu_memory_margin = free_hpu_memory * (
-            1 - self.cache_config.gpu_memory_utilization)
+            1 - self.cache_config.gpu_memory_utilization
+        )
         self.model_runner.mem_margin = hpu_memory_margin
         cache_size_bytes = available_hpu_memory * graph_headroom
         graph_headroom_bytes = available_hpu_memory * (1 - graph_headroom)
@@ -169,11 +181,11 @@ class HPUWorker(LocalOrDistributedWorkerBase):
             f"(gpu_memory_utilization={self.cache_config.gpu_memory_utilization}),"
             f" {format_bytes(graph_headroom_bytes)} reserved for HPUGraphs "
             f"(VLLM_GRAPH_RESERVED_MEM={graph_reserved_mem}), "
-            f"{format_bytes(cache_size_bytes)} reserved for KV cache")
+            f"{format_bytes(cache_size_bytes)} reserved for KV cache"
+        )
         logger.info(msg)
         num_hpu_blocks = int(cache_size_bytes // cache_block_size)
-        num_cpu_blocks = int(self.cache_config.swap_space_bytes //
-                             cache_block_size)
+        num_cpu_blocks = int(self.cache_config.swap_space_bytes // cache_block_size)
         num_hpu_blocks = max(num_hpu_blocks, 0)
         num_cpu_blocks = max(num_cpu_blocks, 0)
 
@@ -183,15 +195,16 @@ class HPUWorker(LocalOrDistributedWorkerBase):
         gc.collect()
         return num_hpu_blocks, num_cpu_blocks
 
-    def initialize_cache(self, num_gpu_blocks: int,
-                         num_cpu_blocks: int) -> None:
+    def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         """Allocate GPU and CPU KV cache with the specified number of blocks.
 
         This also warms up the model, which may record CUDA graphs.
         """
-        raise_if_cache_size_invalid(num_gpu_blocks,
-                                    self.cache_config.block_size,
-                                    self.model_config.max_model_len)
+        raise_if_cache_size_invalid(
+            num_gpu_blocks,
+            self.cache_config.block_size,
+            self.model_config.max_model_len,
+        )
 
         self.cache_config.num_gpu_blocks = num_gpu_blocks
         self.cache_config.num_cpu_blocks = num_cpu_blocks
@@ -199,16 +212,19 @@ class HPUWorker(LocalOrDistributedWorkerBase):
         with HabanaMemoryProfiler() as m:
             self._init_cache_engine()
             torch.hpu.synchronize()
-        msg = ("Initializing cache engine "
-               f"took {m.get_summary_string()}")
+        msg = "Initializing cache engine " f"took {m.get_summary_string()}"
         logger.info(msg)
         self._warm_up_model()
 
     def _init_cache_engine(self):
         assert self.cache_config.num_gpu_blocks is not None
         self.cache_engine = [
-            HPUCacheEngine(self.cache_config, self.model_config,
-                           self.parallel_config, self.device_config)
+            HPUCacheEngine(
+                self.cache_config,
+                self.model_config,
+                self.parallel_config,
+                self.device_config,
+            )
             for _ in range(self.parallel_config.pipeline_parallel_size)
         ]
         self.hpu_cache = [
@@ -238,23 +254,24 @@ class HPUWorker(LocalOrDistributedWorkerBase):
 
     @torch.inference_mode()
     def prepare_worker_input(
-            self, execute_model_req: ExecuteModelRequest) -> WorkerInput:
+        self, execute_model_req: ExecuteModelRequest
+    ) -> WorkerInput:
         virtual_engine = execute_model_req.virtual_engine
         num_seq_groups = len(execute_model_req.seq_group_metadata_list)
         # `blocks_to_swap_in` and `blocks_to_swap_out` are cpu tensors.
         # they contain parameters to launch cudamemcpyasync.
-        blocks_to_swap_in = torch.tensor(execute_model_req.blocks_to_swap_in,
-                                         device="cpu",
-                                         dtype=torch.int64).view(-1, 2)
-        blocks_to_swap_out = torch.tensor(execute_model_req.blocks_to_swap_out,
-                                          device="cpu",
-                                          dtype=torch.int64).view(-1, 2)
+        blocks_to_swap_in = torch.tensor(
+            execute_model_req.blocks_to_swap_in, device="cpu", dtype=torch.int64
+        ).view(-1, 2)
+        blocks_to_swap_out = torch.tensor(
+            execute_model_req.blocks_to_swap_out, device="cpu", dtype=torch.int64
+        ).view(-1, 2)
         # `blocks_to_copy` is a gpu tensor. The src and tgt of
         # blocks to copy are in the same device, and `blocks_to_copy`
         # can be used directly within cuda kernels.
-        blocks_to_copy = torch.tensor(execute_model_req.blocks_to_copy,
-                                      device=self.device,
-                                      dtype=torch.int64).view(-1, 2)
+        blocks_to_copy = torch.tensor(
+            execute_model_req.blocks_to_copy, device=self.device, dtype=torch.int64
+        ).view(-1, 2)
 
         return WorkerInput(
             num_seq_groups=num_seq_groups,
@@ -268,16 +285,20 @@ class HPUWorker(LocalOrDistributedWorkerBase):
     def execute_worker(self, worker_input: WorkerInput) -> None:
         virtual_engine = worker_input.virtual_engine
         # Issue cache operations.
-        if (worker_input.blocks_to_swap_in is not None
-                and worker_input.blocks_to_swap_in.numel() > 0):
-            self.cache_engine[virtual_engine].swap_in(
-                worker_input.blocks_to_swap_in)
-        if (worker_input.blocks_to_swap_out is not None
-                and worker_input.blocks_to_swap_out.numel() > 0):
-            self.cache_engine[virtual_engine].swap_out(
-                worker_input.blocks_to_swap_out)
-        if (worker_input.blocks_to_copy is not None
-                and worker_input.blocks_to_copy.numel() > 0):
+        if (
+            worker_input.blocks_to_swap_in is not None
+            and worker_input.blocks_to_swap_in.numel() > 0
+        ):
+            self.cache_engine[virtual_engine].swap_in(worker_input.blocks_to_swap_in)
+        if (
+            worker_input.blocks_to_swap_out is not None
+            and worker_input.blocks_to_swap_out.numel() > 0
+        ):
+            self.cache_engine[virtual_engine].swap_out(worker_input.blocks_to_swap_out)
+        if (
+            worker_input.blocks_to_copy is not None
+            and worker_input.blocks_to_copy.numel() > 0
+        ):
             self.cache_engine[virtual_engine].copy(worker_input.blocks_to_copy)
 
     def add_lora(self, lora_request: LoRARequest) -> bool:
@@ -292,22 +313,17 @@ class HPUWorker(LocalOrDistributedWorkerBase):
     def list_loras(self) -> Set[int]:
         return self.model_runner.list_loras()
 
-    def add_prompt_adapter(
-            self, prompt_adapter_request: PromptAdapterRequest) -> bool:
-        raise NotImplementedError(
-            "Prompt Adapter is not implemented for HPU backend.")
+    def add_prompt_adapter(self, prompt_adapter_request: PromptAdapterRequest) -> bool:
+        raise NotImplementedError("Prompt Adapter is not implemented for HPU backend.")
 
     def remove_prompt_adapter(self, prompt_adapter_id: int) -> bool:
-        raise NotImplementedError(
-            "Prompt Adapter is not implemented for HPU backend.")
+        raise NotImplementedError("Prompt Adapter is not implemented for HPU backend.")
 
     def pin_prompt_adapter(self, prompt_adapter_id: int) -> bool:
-        raise NotImplementedError(
-            "Prompt Adapter is not implemented for HPU backend.")
+        raise NotImplementedError("Prompt Adapter is not implemented for HPU backend.")
 
     def list_prompt_adapters(self) -> Set[int]:
-        raise NotImplementedError(
-            "Prompt Adapter is not implemented for HPU backend.")
+        raise NotImplementedError("Prompt Adapter is not implemented for HPU backend.")
 
     def shutdown_inc(self):
         self.model_runner.shutdown_inc()
@@ -321,11 +337,10 @@ class HPUWorker(LocalOrDistributedWorkerBase):
         return self.model_runner.vocab_size
 
     def get_cache_block_size_bytes(self) -> int:
-        """Get the size of the KV cache block size in bytes.
-        """
-        return HPUCacheEngine.get_cache_block_size(self.cache_config,
-                                                   self.model_config,
-                                                   self.parallel_config)
+        """Get the size of the KV cache block size in bytes."""
+        return HPUCacheEngine.get_cache_block_size(
+            self.cache_config, self.model_config, self.parallel_config
+        )
 
 
 def init_worker_distributed_environment(
@@ -335,14 +350,20 @@ def init_worker_distributed_environment(
     local_rank: int = -1,
 ) -> None:
     """Initialize the distributed environment."""
-    init_distributed_environment(parallel_config.world_size,
-                                 rank,
-                                 distributed_init_method,
-                                 local_rank,
-                                 backend='hccl')
+    init_distributed_environment(
+        parallel_config.world_size,
+        rank,
+        distributed_init_method,
+        local_rank,
+        backend="hccl",
+    )
 
-    ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
-                                      parallel_config.pipeline_parallel_size)
+    ensure_model_parallel_initialized(
+        parallel_config.tensor_parallel_size,
+        parallel_config.pipeline_parallel_size,
+        parallel_config.moe_tensor_model_parallel_size,
+        parallel_config.moe_expert_model_parallel_size,
+    )
 
     if torch.distributed.is_initialized():
         torch_world_size = torch.distributed.get_world_size()
@@ -350,11 +371,13 @@ def init_worker_distributed_environment(
             raise RuntimeError(
                 "torch.distributed is already initialized but the torch world "
                 "size does not match parallel_config.world_size "
-                f"({torch_world_size} vs. {parallel_config.world_size}).")
+                f"({torch_world_size} vs. {parallel_config.world_size})."
+            )
     elif not distributed_init_method:
         raise ValueError(
             "distributed_init_method must be set if torch.distributed "
-            "is not already initialized")
+            "is not already initialized"
+        )
     else:
         torch.distributed.init_process_group(
             backend="hccl",
@@ -364,19 +387,24 @@ def init_worker_distributed_environment(
         )
 
     # A small all_reduce for warmup & checking conformance.
-    dummy_tensor_hpu = torch.ones(1).to('hpu')
+    dummy_tensor_hpu = torch.ones(1).to("hpu")
     torch.distributed.all_reduce(dummy_tensor_hpu)
     assert dummy_tensor_hpu.item() == parallel_config.world_size
-    ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
-                                      parallel_config.pipeline_parallel_size)
+    ensure_model_parallel_initialized(
+        parallel_config.tensor_parallel_size,
+        parallel_config.pipeline_parallel_size,
+        parallel_config.moe_tensor_model_parallel_size,
+        parallel_config.moe_expert_model_parallel_size,
+    )
 
 
-def raise_if_cache_size_invalid(num_gpu_blocks, block_size,
-                                max_model_len) -> None:
+def raise_if_cache_size_invalid(num_gpu_blocks, block_size, max_model_len) -> None:
     if num_gpu_blocks <= 0:
-        raise ValueError("No available memory for the cache blocks. "
-                         "Try increasing `gpu_memory_utilization` when "
-                         "initializing the engine.")
+        raise ValueError(
+            "No available memory for the cache blocks. "
+            "Try increasing `gpu_memory_utilization` when "
+            "initializing the engine."
+        )
     max_seq_len = block_size * num_gpu_blocks
     if max_model_len > max_seq_len:
         raise ValueError(
@@ -384,7 +412,8 @@ def raise_if_cache_size_invalid(num_gpu_blocks, block_size,
             "is larger than the maximum number of tokens that can be "
             f"stored in KV cache ({max_seq_len}). Try increasing "
             "`gpu_memory_utilization` or decreasing `max_model_len` when "
-            "initializing the engine.")
+            "initializing the engine."
+        )
 
 
 class HPUCacheEngine(CacheEngine):
@@ -396,15 +425,12 @@ class HPUCacheEngine(CacheEngine):
     ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         """Allocates KV cache on the specified device."""
         kv_cache_shape = self.attn_backend.get_kv_cache_shape(
-            num_blocks, self.block_size, self.num_kv_heads, self.head_size)
+            num_blocks, self.block_size, self.num_kv_heads, self.head_size
+        )
         kv_cache: List[Tuple[torch.Tensor, torch.Tensor]] = []
         for _ in range(self.num_attention_layers):
-            key_cache = torch.zeros(kv_cache_shape,
-                                    dtype=self.dtype,
-                                    device=device)
-            value_cache = torch.zeros(kv_cache_shape,
-                                      dtype=self.dtype,
-                                      device=device)
+            key_cache = torch.zeros(kv_cache_shape, dtype=self.dtype, device=device)
+            value_cache = torch.zeros(kv_cache_shape, dtype=self.dtype, device=device)
             kv_layer = (key_cache, value_cache)
             kv_cache.append(kv_layer)
         return kv_cache

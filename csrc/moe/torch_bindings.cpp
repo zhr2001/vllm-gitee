@@ -22,6 +22,23 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, m) {
       "                     Tensor! num_tokens_post_pad) -> ()");
   m.impl("moe_align_block_size", torch::kCUDA, &moe_align_block_size);
 
+  m.def(
+      "moe_permute_before_all2all(Tensor topk_ids, int num_experts,"
+      "                           Tensor sorted_token_ids, Tensor token_cnts,"
+      "                           Tensor reversed_indices) -> ()");
+  m.impl("moe_permute_before_all2all", torch::kCUDA,
+         &moe_permute_before_all2all);
+
+  m.def(
+      "moe_align_block_size_during_all2all(Tensor global_token_cnts,"
+      "                                    Tensor global_token_cnts_cumsum,"
+      "                                    int num_experts, int ep_size,"
+      "                                    int block_size,"
+      "                                    Tensor token_block_expert_ids, "
+      "                                    Tensor expert_input_token_ids) -> ()");
+  m.impl("moe_align_block_size_during_all2all", torch::kCUDA,
+         &moe_align_block_size_during_all2all);
+
 #ifndef USE_ROCM
   m.def(
       "marlin_gemm_moe(Tensor! a, Tensor! b_q_weights, Tensor! sorted_ids, "

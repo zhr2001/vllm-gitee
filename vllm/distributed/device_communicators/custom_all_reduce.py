@@ -77,6 +77,7 @@ class CustomAllreduce:
         assert dist.get_backend(group) != dist.Backend.NCCL, (
             "CustomAllreduce should be attached to a non-NCCL group.")
 
+        print(f"not checked in the same node")
         if not all(in_the_same_node_as(group, source_rank=0)):
             # No need to initialize custom allreduce for multi-node case.
             logger.warning(
@@ -86,6 +87,7 @@ class CustomAllreduce:
 
         rank = dist.get_rank(group=self.group)
         world_size = dist.get_world_size(group=self.group)
+        print(f'ca rank: {rank}, ca world size: {world_size}')
         if world_size == 1:
             # No need to initialize custom allreduce for single GPU case.
             return

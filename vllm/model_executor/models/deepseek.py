@@ -28,16 +28,27 @@ from transformers import PretrainedConfig
 
 from vllm.attention import Attention, AttentionMetadata
 from vllm.config import CacheConfig, VllmConfig
-from vllm.distributed import (get_pp_group, get_tensor_model_parallel_rank,
+from vllm.distributed import (gather_along_first_dim,
+                              get_moe_expert_model_parallel_rank,
+                              get_moe_expert_model_parallel_world_size,
+                              get_moe_tensor_model_parallel_rank,
+                              get_moe_tensor_model_parallel_world_size,
+                              get_pp_group,
                               get_tensor_model_parallel_world_size,
-                              tensor_model_parallel_all_reduce)
+                              moe_gather_along_first_dim,
+                              moe_split_along_first_dim,
+                              moe_tensor_model_parallel_all_reduce,
+                              split_along_first_dim)
+from vllm.distributed.communication_op import moe_tensor_model_parallel_all_gather, tensor_model_parallel_all_gather
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import fused_moe
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (MergedColumnParallelLinear,
+                                               MergedColumnParallelLinearFake,
                                                QKVParallelLinear,
                                                ReplicatedLinear,
-                                               RowParallelLinear)
+                                               RowParallelLinear,
+                                               RowParallelLinearFake)
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
@@ -64,20 +75,28 @@ class DeepseekMLP(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
         prefix: str = "",
+        is_expert: bool = False,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size, [intermediate_size] * 2,
             bias=False,
-            quant_config=quant_config)
-        self.down_proj = RowParallelLinear(intermediate_size,
-                                           hidden_size,
-                                           bias=False,
-                                           quant_config=quant_config,
-                                           reduce_results=reduce_results)
+            quant_config=quant_config,
+            is_expert=is_expert,
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            reduce_results=reduce_results,
+            is_expert=is_expert,
+        )
         if hidden_act != "silu":
-            raise ValueError(f"Unsupported activation: {hidden_act}. "
-                             "Only silu is supported for now.")
+            raise ValueError(
+                f"Unsupported activation: {hidden_act}. "
+                "Only silu is supported for now."
+            )
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
@@ -85,6 +104,18 @@ class DeepseekMLP(nn.Module):
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
+
+
+class DeepseekMLPFake(nn.Module):
+    def __init__(
+        self,
+    ):
+        super().__init__()
+        self.gate_up_proj = MergedColumnParallelLinearFake()
+        self.down_proj = RowParallelLinearFake()
+
+    def forward(self, x):
+        raise NotImplementedError()
 
 
 class DeepseekMoE(nn.Module):
@@ -97,33 +128,46 @@ class DeepseekMoE(nn.Module):
     ):
         super().__init__()
         self.config = config
-        self.rank = get_tensor_model_parallel_rank()
-        self.tp_size = get_tensor_model_parallel_world_size()
+        self.tp_rank = get_moe_tensor_model_parallel_rank()
+        self.tp_size = get_moe_tensor_model_parallel_world_size()
+        self.ep_rank = get_moe_expert_model_parallel_rank()
+        self.ep_size = get_moe_expert_model_parallel_world_size()
+        self.use_ep = self.ep_size > 1
         self.n_routed_experts = config.n_routed_experts
         self.top_k = config.num_experts_per_tok
         if self.tp_size > self.n_routed_experts:
             raise ValueError(
                 f"Tensor parallel size {self.tp_size} is greater than "
-                f"the number of experts {self.n_routed_experts}.")
+                f"the number of experts {self.n_routed_experts}."
+            )
 
-        self.experts = nn.ModuleList([
-            DeepseekMLP(hidden_size=config.hidden_size,
-                        intermediate_size=config.moe_intermediate_size,
-                        hidden_act=config.hidden_act,
-                        quant_config=quant_config,
-                        reduce_results=False)
-            for idx in range(self.n_routed_experts)
-        ])
+        self.experts = nn.ModuleList(
+            [DeepseekMLPFake() for _ in range(self.n_routed_experts)]
+        )
+        self.expert_ids = list(
+            range(
+                self.ep_rank * self.n_routed_experts // self.ep_size,
+                (self.ep_rank + 1) * self.n_routed_experts // self.ep_size,
+            )
+        )
+        # print(f'self.expert_ids: {self.expert_ids}')
+        for idx in self.expert_ids:
+            self.experts[idx] = DeepseekMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size,
+                hidden_act=config.hidden_act,
+                quant_config=quant_config,
+                reduce_results=False,
+                is_expert=True,
+            )
         self.pack_params()
 
-        self.gate = ReplicatedLinear(config.hidden_size,
-                                     self.n_routed_experts,
-                                     bias=False,
-                                     quant_config=None)
+        self.gate = ReplicatedLinear(
+            config.hidden_size, self.n_routed_experts, bias=False, quant_config=None
+        )
 
         if config.n_shared_experts is not None:
-            intermediate_size = (config.moe_intermediate_size *
-                                 config.n_shared_experts)
+            intermediate_size = config.moe_intermediate_size * config.n_shared_experts
             self.shared_experts = DeepseekMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
@@ -135,7 +179,7 @@ class DeepseekMoE(nn.Module):
     def pack_params(self):
         w1 = []
         w2 = []
-        for expert in self.experts:
+        for expert in self.experts[self.expert_ids[0] : self.expert_ids[-1] + 1]:
             w1.append(expert.gate_up_proj.weight)
             w2.append(expert.down_proj.weight)
         self.w1 = torch._utils._flatten_dense_tensors(w1)
@@ -153,23 +197,49 @@ class DeepseekMoE(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         num_tokens, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
+
+        if self.use_ep:
+            tp_sp_tokens = split_along_first_dim(hidden_states)
+            print(f'moe input split shape: {tp_sp_tokens.shape}')
+            output_splits_tp = moe_tensor_model_parallel_all_gather(
+                torch.tensor(
+                    [tp_sp_tokens.size(0)], dtype=torch.int32, device=hidden_states.device
+                )
+            ).tolist()
+            moe_tp_sp_tokens = moe_gather_along_first_dim(
+                tp_sp_tokens, output_splits_tp
+            )
+            print(f'moe split gathered tensor shape: {moe_tp_sp_tokens.shape}')
+            hidden_states = moe_tp_sp_tokens.view(-1, hidden_dim)
+        else:
+            hidden_states = hidden_states.view(-1, hidden_dim)
         if self.config.n_shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
-        # router_logits: (num_tokens, n_experts)
+
         router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = fused_moe(hidden_states,
-                                        self.w1,
-                                        self.w2,
-                                        router_logits,
-                                        self.top_k,
-                                        renormalize=self.config.norm_topk_prob,
-                                        inplace=True)
+        final_hidden_states = fused_moe(
+            hidden_states,
+            self.w1,
+            self.w2,
+            router_logits,
+            self.top_k,
+            renormalize=self.config.norm_topk_prob,
+            inplace=True,
+            enable_ep=self.use_ep,
+            ep_size=self.ep_size,
+        )
 
         if self.config.n_shared_experts is not None:
             final_hidden_states = final_hidden_states + shared_output
-        final_hidden_states = tensor_model_parallel_all_reduce(
-            final_hidden_states)
+
+        if self.use_ep:
+            final_hidden_states = moe_tensor_model_parallel_all_reduce(
+                final_hidden_states
+            )
+            moe_sp_tp_tokens = moe_split_along_first_dim(
+                final_hidden_states, output_splits_tp
+            )
+            final_hidden_states = gather_along_first_dim(moe_sp_tp_tokens)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
@@ -234,13 +304,15 @@ class DeepseekAttention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
-        self.attn = Attention(self.num_heads,
-                              self.head_dim,
-                              self.scaling,
-                              num_kv_heads=self.num_kv_heads,
-                              cache_config=cache_config,
-                              quant_config=quant_config,
-                              prefix=f"{prefix}.attn")
+        self.attn = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attn",
+        )
 
     def forward(
         self,
@@ -271,8 +343,7 @@ class DeepseekDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 10000)
         rope_scaling = getattr(config, "rope_scaling", None)
-        max_position_embeddings = getattr(config, "max_position_embeddings",
-                                          8192)
+        max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.self_attn = DeepseekAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -284,12 +355,14 @@ class DeepseekDecoderLayer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.self_attn",
         )
-        if (config.n_routed_experts is not None
-                and layer_idx >= config.first_k_dense_replace
-                and layer_idx % config.moe_layer_freq == 0):
-            self.mlp = DeepseekMoE(config=config,
-                                   quant_config=quant_config,
-                                   prefix=f"{prefix}.mlp")
+        if (
+            config.n_routed_experts is not None
+            and layer_idx >= config.first_k_dense_replace
+            and layer_idx % config.moe_layer_freq == 0
+        ):
+            self.mlp = DeepseekMoE(
+                config=config, quant_config=quant_config, prefix=f"{prefix}.mlp"
+            )
         else:
             self.mlp = DeepseekMLP(
                 hidden_size=config.hidden_size,
@@ -298,10 +371,10 @@ class DeepseekDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
             )
-        self.input_layernorm = RMSNorm(config.hidden_size,
-                                       eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size,
-                                                eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
     def forward(
         self,
@@ -316,8 +389,7 @@ class DeepseekDecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         else:
-            hidden_states, residual = self.input_layernorm(
-                hidden_states, residual)
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
@@ -326,8 +398,7 @@ class DeepseekDecoderLayer(nn.Module):
         )
 
         # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -355,11 +426,12 @@ class DeepseekModel(nn.Module):
             lambda prefix: DeepseekDecoderLayer(
                 config, cache_config, quant_config=quant_config, prefix=prefix
             ),
-            prefix=f"{prefix}.layers")
+            prefix=f"{prefix}.layers",
+        )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.make_empty_intermediate_tensors = (
-            make_empty_intermediate_tensors_factory(
-                ["hidden_states", "residual"], config.hidden_size))
+        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+            ["hidden_states", "residual"], config.hidden_size
+        )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -384,14 +456,17 @@ class DeepseekModel(nn.Module):
             residual = intermediate_tensors["residual"]
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
-            hidden_states, residual = layer(positions, hidden_states,
-                                            kv_caches[i - self.start_layer],
-                                            attn_metadata, residual)
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                kv_caches[i - self.start_layer],
+                attn_metadata,
+                residual,
+            )
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors({
-                "hidden_states": hidden_states,
-                "residual": residual
-            })
+            return IntermediateTensors(
+                {"hidden_states": hidden_states, "residual": residual}
+            )
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
@@ -404,17 +479,19 @@ class DeepseekForCausalLM(nn.Module, SupportsPP):
         quant_config = vllm_config.quant_config
         self.config = config
         self.quant_config = quant_config
-        self.model = DeepseekModel(vllm_config=vllm_config,
-                                   prefix=maybe_prefix(prefix, "model"))
-        self.lm_head = ParallelLMHead(config.vocab_size,
-                                      config.hidden_size,
-                                      quant_config=quant_config)
+        self.model = DeepseekModel(
+            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
+        )
+        self.lm_head = ParallelLMHead(
+            config.vocab_size, config.hidden_size, quant_config=quant_config
+        )
         if self.config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
         self.logits_processor = LogitsProcessor(config.vocab_size)
         self.sampler = get_sampler()
         self.make_empty_intermediate_tensors = (
-            self.model.make_empty_intermediate_tensors)
+            self.model.make_empty_intermediate_tensors
+        )
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.get_input_embeddings(input_ids)
@@ -428,9 +505,14 @@ class DeepseekForCausalLM(nn.Module, SupportsPP):
         intermediate_tensors: Optional[IntermediateTensors] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, IntermediateTensors]:
-        hidden_states = self.model(input_ids, positions, kv_caches,
-                                   attn_metadata, intermediate_tensors,
-                                   inputs_embeds)
+        hidden_states = self.model(
+            input_ids,
+            positions,
+            kv_caches,
+            attn_metadata,
+            intermediate_tensors,
+            inputs_embeds,
+        )
         return hidden_states
 
     def compute_logits(
@@ -438,8 +520,7 @@ class DeepseekForCausalLM(nn.Module, SupportsPP):
         hidden_states: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> Optional[torch.Tensor]:
-        logits = self.logits_processor(self.lm_head, hidden_states,
-                                       sampling_metadata)
+        logits = self.logits_processor(self.lm_head, hidden_states, sampling_metadata)
         return logits
 
     def sample(

@@ -42,11 +42,11 @@ class TPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         if self.cache_config.cache_dtype == "auto":
             self.cache_dtype = self.model_config.dtype
         else:
-            self.cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[
-                self.cache_config.cache_dtype]
+            self.cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[self.cache_config.cache_dtype]
 
         self.model_runner: TPUModelRunner = TPUModelRunner(
-            vllm_config=vllm_config, is_driver_worker=is_driver_worker)
+            vllm_config=vllm_config, is_driver_worker=is_driver_worker
+        )
 
     def init_device(self) -> None:
         os.environ["PJRT_DEVICE"] = "TPU"
@@ -66,7 +66,10 @@ class TPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         )
         ensure_model_parallel_initialized(
             self.parallel_config.tensor_parallel_size,
-            self.parallel_config.pipeline_parallel_size)
+            self.parallel_config.pipeline_parallel_size,
+            self.parallel_config.moe_tensor_model_parallel_size,
+            self.parallel_config.moe_expert_model_parallel_size,
+        )
 
         # Device initialization should happen after initializing the distributed
         # runtime.
@@ -87,8 +90,9 @@ class TPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         # can have slightly different XLA graphs.
         world_size = self.parallel_config.world_size
         rank = xr.global_ordinal()
-        per_rank_path = os.path.join(envs.VLLM_XLA_CACHE_PATH,
-                                     f"tp{world_size}_rank{rank}")
+        per_rank_path = os.path.join(
+            envs.VLLM_XLA_CACHE_PATH, f"tp{world_size}_rank{rank}"
+        )
         xr.initialize_cache(per_rank_path, readonly=False)
 
     def load_model(self):
@@ -103,11 +107,13 @@ class TPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         # it by reference, rather by specializing on the value ``None``.
         # the `dtype` argument does not matter, and we use `float32` as
         # a placeholder (it has wide hardware support).
-        kv_caches = [(torch.tensor([], dtype=torch.float32,
-                                   device=self.device),
-                      torch.tensor([], dtype=torch.float32,
-                                   device=self.device))
-                     for _ in range(num_layers)]
+        kv_caches = [
+            (
+                torch.tensor([], dtype=torch.float32, device=self.device),
+                torch.tensor([], dtype=torch.float32, device=self.device),
+            )
+            for _ in range(num_layers)
+        ]
         self.model_runner._dummy_run(
             batch_size=1,
             seq_len=self.scheduler_config.max_num_batched_tokens,
@@ -124,18 +130,24 @@ class TPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         profiled = m["peak_bytes_used"]  # Weights + intermediate activations.
 
         # Calculate the TPU KV cache size based on profiling.
-        usable_memory_size = int(total_memory_size *
-                                 self.cache_config.gpu_memory_utilization)
+        usable_memory_size = int(
+            total_memory_size * self.cache_config.gpu_memory_utilization
+        )
         tpu_kv_cache_bytes = max(usable_memory_size - profiled, 0)
         dtype_btyes = get_dtype_size(self.cache_dtype)
-        block_size_bytes = (dtype_btyes * self.cache_config.block_size *
-                            num_layers * 2 * head_size * num_kv_heads)
+        block_size_bytes = (
+            dtype_btyes
+            * self.cache_config.block_size
+            * num_layers
+            * 2
+            * head_size
+            * num_kv_heads
+        )
         num_tpu_blocks = tpu_kv_cache_bytes // block_size_bytes
         num_tpu_blocks = (num_tpu_blocks // 8) * 8  # Round down to 8.
 
         # Calculate the CPU KV cache size based on the config.
-        num_cpu_blocks = int(self.cache_config.swap_space_bytes //
-                             block_size_bytes)
+        num_cpu_blocks = int(self.cache_config.swap_space_bytes // block_size_bytes)
         num_cpu_blocks = (num_cpu_blocks // 8) * 8  # Round down to 8.
         return num_tpu_blocks, num_cpu_blocks
 
@@ -156,18 +168,16 @@ class TPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         self.cpu_cache: List[Tuple[torch.Tensor, torch.Tensor]] = []
         self.tpu_cache: List[Tuple[torch.Tensor, torch.Tensor]] = []
         tpu_cache_shape = self.model_runner.attn_backend.get_kv_cache_shape(
-            num_gpu_blocks, self.block_size, num_kv_heads, head_size)
+            num_gpu_blocks, self.block_size, num_kv_heads, head_size
+        )
         cpu_cache_shape = self.model_runner.attn_backend.get_kv_cache_shape(
-            num_cpu_blocks, self.block_size, num_kv_heads, head_size)
+            num_cpu_blocks, self.block_size, num_kv_heads, head_size
+        )
         for _ in range(num_layers):
-            tpu_k_cache = torch.zeros(tpu_cache_shape,
-                                      dtype=dtype,
-                                      device=self.device)
+            tpu_k_cache = torch.zeros(tpu_cache_shape, dtype=dtype, device=self.device)
             tpu_v_cache = torch.zeros_like(tpu_k_cache)
             self.tpu_cache.append((tpu_k_cache, tpu_v_cache))
-            cpu_k_cache = torch.zeros(cpu_cache_shape,
-                                      dtype=dtype,
-                                      device="cpu")
+            cpu_k_cache = torch.zeros(cpu_cache_shape, dtype=dtype, device="cpu")
             cpu_v_cache = torch.zeros_like(cpu_k_cache)
             self.cpu_cache.append((cpu_k_cache, cpu_v_cache))
         self._warmup_model()
@@ -213,11 +223,14 @@ class TPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         virtual_engine = execute_model_req.virtual_engine
         num_seq_groups = len(execute_model_req.seq_group_metadata_list)
         blocks_to_swap_in = _make_src_to_dst(
-            execute_model_req.blocks_to_swap_in, "cpu", self.device)
+            execute_model_req.blocks_to_swap_in, "cpu", self.device
+        )
         blocks_to_swap_out = _make_src_to_dst(
-            execute_model_req.blocks_to_swap_out, self.device, "cpu")
-        blocks_to_copy = _make_src_to_dst(execute_model_req.blocks_to_copy,
-                                          self.device, self.device)
+            execute_model_req.blocks_to_swap_out, self.device, "cpu"
+        )
+        blocks_to_copy = _make_src_to_dst(
+            execute_model_req.blocks_to_copy, self.device, self.device
+        )
         return WorkerInput(
             num_seq_groups=num_seq_groups,
             blocks_to_swap_in=blocks_to_swap_in,
@@ -257,8 +270,7 @@ class TPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         if worker_input.blocks_to_copy is not None:
             src_indices, dst_indices = worker_input.blocks_to_copy
             if src_indices.numel() > 0:
-                attn_backend.copy_blocks(self.tpu_cache,
-                                         (src_indices, dst_indices))
+                attn_backend.copy_blocks(self.tpu_cache, (src_indices, dst_indices))
 
 
 def _make_src_to_dst(
@@ -271,12 +283,8 @@ def _make_src_to_dst(
 
     src_indices = [i for i, _ in mapping]
     dst_indices = [i for _, i in mapping]
-    src_indices = torch.tensor(src_indices,
-                               device=src_device,
-                               dtype=torch.int64)
-    dst_indices = torch.tensor(dst_indices,
-                               device=dst_device,
-                               dtype=torch.int64)
+    src_indices = torch.tensor(src_indices, device=src_device, dtype=torch.int64)
+    dst_indices = torch.tensor(dst_indices, device=dst_device, dtype=torch.int64)
     return src_indices, dst_indices
 
 

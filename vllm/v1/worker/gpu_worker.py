@@ -1,4 +1,5 @@
 """A GPU worker class."""
+
 import gc
 import os
 from typing import TYPE_CHECKING, Optional, Tuple
@@ -56,14 +57,17 @@ class Worker:
         if self.model_config.trust_remote_code:
             # note: lazy import to avoid importing torch before initializing
             from vllm.utils import init_cached_hf_modules
+
             init_cached_hf_modules()
 
         # Torch profiler. Enabled and configured through env vars:
         # VLLM_TORCH_PROFILER_DIR=/path/to/save/trace
         if envs.VLLM_TORCH_PROFILER_DIR:
             torch_profiler_trace_dir = envs.VLLM_TORCH_PROFILER_DIR
-            logger.info("Profiling enabled. Traces will be saved to: %s",
-                        torch_profiler_trace_dir)
+            logger.info(
+                "Profiling enabled. Traces will be saved to: %s",
+                torch_profiler_trace_dir,
+            )
             self.profiler = torch.profiler.profile(
                 activities=[
                     torch.profiler.ProfilerActivity.CPU,
@@ -71,7 +75,9 @@ class Worker:
                 ],
                 with_stack=True,
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    torch_profiler_trace_dir, use_gzip=True))
+                    torch_profiler_trace_dir, use_gzip=True
+                ),
+            )
         else:
             self.profiler = None
 
@@ -95,12 +101,14 @@ class Worker:
             torch.cuda.empty_cache()
             self.init_gpu_memory = torch.cuda.mem_get_info()[0]
         else:
-            raise RuntimeError(
-                f"Not support device type: {self.device_config.device}")
+            raise RuntimeError(f"Not support device type: {self.device_config.device}")
         # Initialize the distributed environment.
-        init_worker_distributed_environment(self.parallel_config, self.rank,
-                                            self.distributed_init_method,
-                                            self.local_rank)
+        init_worker_distributed_environment(
+            self.parallel_config,
+            self.rank,
+            self.distributed_init_method,
+            self.local_rank,
+        )
         # Set random seed.
         set_random_seed(self.model_config.seed)
 
@@ -141,7 +149,8 @@ class Worker:
             "Error in memory profiling. "
             f"Initial free memory {self.init_gpu_memory}, current free memory"
             f" {free_gpu_memory}. This happens when the GPU memory was "
-            "not properly cleaned up before initializing the vLLM instance.")
+            "not properly cleaned up before initializing the vLLM instance."
+        )
 
         # Get the peak memory allocation recorded by torch
         peak_memory = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
@@ -150,22 +159,22 @@ class Worker:
         # gpu outside of `torch`. NCCL operations, for example, can use a few
         # GB during a forward pass
         torch.cuda.empty_cache()
-        torch_allocated_bytes = torch.cuda.memory_stats(
-        )["allocated_bytes.all.current"]
-        total_allocated_bytes = torch.cuda.mem_get_info(
-        )[1] - torch.cuda.mem_get_info()[0]
+        torch_allocated_bytes = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        total_allocated_bytes = (
+            torch.cuda.mem_get_info()[1] - torch.cuda.mem_get_info()[0]
+        )
         non_torch_allocations = total_allocated_bytes - torch_allocated_bytes
         if non_torch_allocations > 0:
             peak_memory += non_torch_allocations
         available_kv_cache_memory = (
-            total_gpu_memory * self.cache_config.gpu_memory_utilization -
-            peak_memory)
+            total_gpu_memory * self.cache_config.gpu_memory_utilization - peak_memory
+        )
 
         # Calculate the number of blocks that can be allocated with the
         # profiled peak memory.
-        cache_block_size = _get_cache_block_size(self.cache_config,
-                                                 self.model_config,
-                                                 self.parallel_config)
+        cache_block_size = _get_cache_block_size(
+            self.cache_config, self.model_config, self.parallel_config
+        )
         num_gpu_blocks = int(available_kv_cache_memory // cache_block_size)
         num_gpu_blocks = max(num_gpu_blocks, 0)
         return num_gpu_blocks, 0
@@ -173,9 +182,11 @@ class Worker:
     def initialize_cache(self, num_gpu_blocks: int) -> None:
         """Allocate GPU and CPU KV cache with the specified number of blocks."""
         if num_gpu_blocks <= 0:
-            raise ValueError("No available memory for the cache blocks. "
-                             "Try increasing `gpu_memory_utilization` when "
-                             "initializing the engine.")
+            raise ValueError(
+                "No available memory for the cache blocks. "
+                "Try increasing `gpu_memory_utilization` when "
+                "initializing the engine."
+            )
 
         max_seq_len = self.cache_config.block_size * num_gpu_blocks
         max_model_len = self.model_config.max_model_len
@@ -185,7 +196,8 @@ class Worker:
                 "is larger than the maximum number of tokens that can be "
                 f"stored in KV cache ({max_seq_len}). Try increasing "
                 "`gpu_memory_utilization` or decreasing `max_model_len` when "
-                "initializing the engine.")
+                "initializing the engine."
+            )
 
         self.model_runner.initialize_kv_cache(num_gpu_blocks)
 
@@ -226,11 +238,16 @@ def init_worker_distributed_environment(
     """Initialize the distributed environment."""
     set_custom_all_reduce(not parallel_config.disable_custom_all_reduce)
 
-    init_distributed_environment(parallel_config.world_size, rank,
-                                 distributed_init_method, local_rank)
+    init_distributed_environment(
+        parallel_config.world_size, rank, distributed_init_method, local_rank
+    )
 
-    ensure_model_parallel_initialized(parallel_config.tensor_parallel_size,
-                                      parallel_config.pipeline_parallel_size)
+    ensure_model_parallel_initialized(
+        parallel_config.tensor_parallel_size,
+        parallel_config.pipeline_parallel_size,
+        parallel_config.moe_tensor_model_parallel_size,
+        parallel_config.moe_expert_model_parallel_size,
+    )
 
 
 def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):
@@ -250,7 +267,8 @@ def _check_if_gpu_supports_dtype(torch_dtype: torch.dtype):
                 "Bfloat16 is only supported on GPUs with compute capability "
                 f"of at least 8.0. Your {gpu_name} GPU {compute_str}. "
                 "You can use float16 instead by explicitly setting the"
-                "`dtype` flag in CLI, for example: --dtype=half.")
+                "`dtype` flag in CLI, for example: --dtype=half."
+            )
 
 
 def _get_cache_block_size(
@@ -261,7 +279,8 @@ def _get_cache_block_size(
     head_size = model_config.get_head_size()
     num_heads = model_config.get_num_kv_heads(parallel_config)
     num_attention_layers = model_config.get_num_layers_by_block_type(
-        parallel_config, LayerBlockType.attention)
+        parallel_config, LayerBlockType.attention
+    )
 
     key_cache_block = cache_config.block_size * num_heads * head_size
     value_cache_block = key_cache_block

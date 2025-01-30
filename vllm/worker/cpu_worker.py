@@ -1,4 +1,5 @@
 """A CPU worker class."""
+
 from typing import Dict, List, Optional, Tuple, Type
 
 import torch
@@ -32,9 +33,13 @@ class CPUCacheEngine:
     as copying.
     """
 
-    def __init__(self, cache_config: CacheConfig, model_config: ModelConfig,
-                 parallel_config: ParallelConfig,
-                 device_config: DeviceConfig) -> None:
+    def __init__(
+        self,
+        cache_config: CacheConfig,
+        model_config: ModelConfig,
+        parallel_config: ParallelConfig,
+        device_config: DeviceConfig,
+    ) -> None:
         assert device_config.device_type == "cpu"
         self.cache_config = cache_config
         self.model_config = model_config
@@ -73,11 +78,11 @@ class CPUCacheEngine:
     ) -> List[torch.Tensor]:
         """Allocates KV cache on CPU."""
         kv_cache_shape = self.attn_backend.get_kv_cache_shape(
-            num_blocks, self.block_size, self.num_heads, self.head_size)
+            num_blocks, self.block_size, self.num_heads, self.head_size
+        )
         kv_cache: List[torch.Tensor] = []
         for _ in range(self.num_layers):
-            kv_cache.append(
-                torch.empty(kv_cache_shape, dtype=self.dtype, device="cpu"))
+            kv_cache.append(torch.empty(kv_cache_shape, dtype=self.dtype, device="cpu"))
         return kv_cache
 
     def swap_in(self, src_to_dst: Dict[int, int]) -> None:
@@ -114,8 +119,8 @@ class CPUCacheEngine:
 class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
     """A worker class that executes (a partition of) the model on a CPU socket.
 
-    Each worker is associated with a single CPU socket. The worker is 
-    responsible for maintaining the KV cache and executing the model on the 
+    Each worker is associated with a single CPU socket. The worker is
+    responsible for maintaining the KV cache and executing the model on the
     CPU. In case of distributed inference, each worker is assigned a partition
     of the model.
     """
@@ -143,6 +148,7 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         if self.model_config.trust_remote_code:
             # note: lazy import to avoid importing torch before initializing
             from vllm.utils import init_cached_hf_modules
+
             init_cached_hf_modules()
 
         # Setup OpenMP threads affinity.
@@ -156,12 +162,16 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         # mlp_speculator
         speculative_config = self.speculative_config
         model_config = self.model_config
-        speculative_args = {} if speculative_config is None \
-            or (speculative_config.draft_model_config.model ==
-                model_config.model) \
-            or (speculative_config.draft_model_config.hf_config.model_type
-                not in ["medusa", "mlp_speculator", "eagle"]) \
-                    else {"return_hidden_states": True}
+        speculative_args = (
+            {}
+            if speculative_config is None
+            or (speculative_config.draft_model_config.model == model_config.model)
+            or (
+                speculative_config.draft_model_config.hf_config.model_type
+                not in ["medusa", "mlp_speculator", "eagle"]
+            )
+            else {"return_hidden_states": True}
+        )
         ModelRunnerClass: Type[CPUModelRunnerBase] = CPUModelRunner
         if self.model_config.runner_type == "pooling":
             ModelRunnerClass = CPUPoolingModelRunner
@@ -185,15 +195,19 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         # VLLM_TORCH_PROFILER_DIR=/path/to/save/trace
         if envs.VLLM_TORCH_PROFILER_DIR:
             torch_profiler_trace_dir = envs.VLLM_TORCH_PROFILER_DIR
-            logger.info("Profiling enabled. Traces will be saved to: %s",
-                        torch_profiler_trace_dir)
+            logger.info(
+                "Profiling enabled. Traces will be saved to: %s",
+                torch_profiler_trace_dir,
+            )
             self.profiler = torch.profiler.profile(
                 activities=[
                     torch.profiler.ProfilerActivity.CPU,
                 ],
                 with_stack=True,
                 on_trace_ready=torch.profiler.tensorboard_trace_handler(
-                    torch_profiler_trace_dir, use_gzip=True))
+                    torch_profiler_trace_dir, use_gzip=True
+                ),
+            )
         else:
             self.profiler = None
 
@@ -234,8 +248,9 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         # For CPU device, the block number will be calculated based on the
         # cpu_kvcache_space.
         cache_block_size = self.get_cache_block_size_bytes()
-        num_cpu_blocks = int(self.cache_config.cpu_kvcache_space_bytes //
-                             cache_block_size)
+        num_cpu_blocks = int(
+            self.cache_config.cpu_kvcache_space_bytes // cache_block_size
+        )
         num_cpu_blocks = max(num_cpu_blocks, 0)
 
         # Note: To reuse the cache management procedure,
@@ -244,16 +259,14 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         num_cpu_blocks = 0
         return num_gpu_blocks, num_cpu_blocks
 
-    def initialize_cache(self, num_gpu_blocks: int,
-                         num_cpu_blocks: int) -> None:
+    def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
         """Initialize the KV cache. Currently, swappable CPU memory is not
         supported.
 
         Since this worker does not support GPUs, we use the num_gpu_blocks to
         determine how many non-swappable CPU blocks to allocate.
         """
-        assert (num_cpu_blocks == 0
-                ), f"{type(self)} does not support swappable cache"
+        assert num_cpu_blocks == 0, f"{type(self)} does not support swappable cache"
 
         # Note: To reuse the cache management procedure,
         # use cpu cache as 'gpu cache'.
@@ -267,12 +280,13 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         self._init_cache_engine()
 
     def _validate_num_cpu_blocks(self, num_cpu_blocks: int) -> None:
-        """Raise errors if the num_cpu_blocks is invalid.
-        """
+        """Raise errors if the num_cpu_blocks is invalid."""
         if num_cpu_blocks <= 0:
-            raise ValueError("No available memory for the cache blocks. "
-                             "Try increasing `VLLM_CPU_KVCACHE_SPACE` when "
-                             "initializing the engine.")
+            raise ValueError(
+                "No available memory for the cache blocks. "
+                "Try increasing `VLLM_CPU_KVCACHE_SPACE` when "
+                "initializing the engine."
+            )
 
         max_seq_len = self.cache_config.block_size * num_cpu_blocks
         if self.model_config.max_model_len > max_seq_len:
@@ -281,12 +295,17 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
                 "is larger than the maximum number of tokens that can be "
                 f"stored in KV cache ({max_seq_len}). Try increasing "
                 "`VLLM_CPU_KVCACHE_SPACE` or decreasing `max_model_len` when "
-                "initializing the engine.")
+                "initializing the engine."
+            )
 
     def _init_cache_engine(self) -> None:
         self.cache_engine = [
-            CPUCacheEngine(self.cache_config, self.model_config,
-                           self.parallel_config, self.device_config)
+            CPUCacheEngine(
+                self.cache_config,
+                self.model_config,
+                self.parallel_config,
+                self.device_config,
+            )
             for _ in range(self.parallel_config.pipeline_parallel_size)
         ]
         self.cpu_cache = [
@@ -297,7 +316,8 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
         assert all(
             self.cpu_cache[ve] is not None
-            for ve in range(self.parallel_config.pipeline_parallel_size))
+            for ve in range(self.parallel_config.pipeline_parallel_size)
+        )
 
         # Populate the cache to warmup the memory
         for ve in range(self.parallel_config.pipeline_parallel_size):
@@ -324,20 +344,24 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         self,
         worker_input: WorkerInput,
     ) -> None:
-        if (worker_input.blocks_to_copy is not None
-                and worker_input.blocks_to_copy.numel() > 0):
+        if (
+            worker_input.blocks_to_copy is not None
+            and worker_input.blocks_to_copy.numel() > 0
+        ):
             self.cache_engine[worker_input.virtual_engine].copy(
-                worker_input.blocks_to_copy)
+                worker_input.blocks_to_copy
+            )
 
     @torch.inference_mode()
     def prepare_worker_input(
-            self, execute_model_req: ExecuteModelRequest) -> WorkerInput:
+        self, execute_model_req: ExecuteModelRequest
+    ) -> WorkerInput:
         assert execute_model_req is not None
         virtual_engine: int = execute_model_req.virtual_engine
         num_seq_groups: int = len(execute_model_req.seq_group_metadata_list)
-        blocks_to_copy = torch.tensor(execute_model_req.blocks_to_copy,
-                                      device="cpu",
-                                      dtype=torch.int64).view(-1, 2)
+        blocks_to_copy = torch.tensor(
+            execute_model_req.blocks_to_copy, device="cpu", dtype=torch.int64
+        ).view(-1, 2)
         assert len(execute_model_req.blocks_to_swap_in) == 0
         assert len(execute_model_req.blocks_to_swap_out) == 0
         return WorkerInput(
@@ -364,11 +388,16 @@ class CPUWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
         ensure_model_parallel_initialized(
             parallel_config.tensor_parallel_size,
-            parallel_config.pipeline_parallel_size)
+            parallel_config.pipeline_parallel_size,
+            parallel_config.moe_tensor_model_parallel_size,
+            parallel_config.moe_expert_model_parallel_size,
+        )
 
     def get_cache_block_size_bytes(self) -> int:
-        """Return the size in bytes of a single KV cache block.
-        """
+        """Return the size in bytes of a single KV cache block."""
         return CPUCacheEngine.get_cache_block_size(
-            self.cache_config.block_size, self.cache_config.cache_dtype,
-            self.model_config, self.parallel_config)
+            self.cache_config.block_size,
+            self.cache_config.cache_dtype,
+            self.model_config,
+            self.parallel_config,
+        )

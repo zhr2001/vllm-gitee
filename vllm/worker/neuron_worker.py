@@ -1,4 +1,5 @@
 """A Neuron worker class."""
+
 from typing import List, Optional, Tuple
 
 import torch
@@ -16,8 +17,7 @@ from vllm.worker.worker_base import (LocalOrDistributedWorkerBase,
 
 
 class NeuronWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
-    """A worker class that executes the model on a group of neuron cores.
-    """
+    """A worker class that executes the model on a group of neuron cores."""
 
     def __init__(
         self,
@@ -33,10 +33,12 @@ class NeuronWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
         if self.model_config.trust_remote_code:
             # note: lazy import to avoid importing torch before initializing
             from vllm.utils import init_cached_hf_modules
+
             init_cached_hf_modules()
 
         self.model_runner: NeuronModelRunner = NeuronModelRunner(
-            vllm_config=vllm_config)
+            vllm_config=vllm_config
+        )
         self.is_driver_worker = True
 
     def init_device(self) -> None:
@@ -65,10 +67,8 @@ class NeuronWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
         return num_gpu_blocks, num_cpu_blocks
 
-    def initialize_cache(self, num_gpu_blocks: int,
-                         num_cpu_blocks: int) -> None:
-        """Initialize the KV cache.
-        """
+    def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:
+        """Initialize the KV cache."""
 
         # Different values are not tested.
         assert num_cpu_blocks == 0
@@ -87,9 +87,11 @@ class NeuronWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
 
     @torch.inference_mode()
     def prepare_worker_input(
-            self, execute_model_req: ExecuteModelRequest) -> WorkerInput:
-        return WorkerInput(num_seq_groups=len(
-            execute_model_req.seq_group_metadata_list), )
+        self, execute_model_req: ExecuteModelRequest
+    ) -> WorkerInput:
+        return WorkerInput(
+            num_seq_groups=len(execute_model_req.seq_group_metadata_list),
+        )
 
     def execute_worker(self, worker_input: WorkerInput) -> None:
         pass
@@ -113,7 +115,4 @@ class NeuronWorker(LoraNotSupportedWorkerBase, LocalOrDistributedWorkerBase):
             distributed_init_method=self.distributed_init_method,
             backend="gloo",
         )
-        ensure_model_parallel_initialized(
-            1,
-            1,
-        )
+        ensure_model_parallel_initialized(1, 1, 1, 1)

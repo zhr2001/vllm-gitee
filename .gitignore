@@ -200,8 +200,11 @@ _build/
 hip_compat.h
 
 # Benchmark dataset
-benchmarks/*.json
 
 # Linting
 actionlint
 shellcheck*/
+*ShareGPT*
+
+*cof*
+**/cof*/**
